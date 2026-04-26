@@ -1,0 +1,43 @@
+# Gnorise GitHub Action
+name: 'Gnorise Dependency Audit'
+description: 'Understand, clean, and secure your dependencies with real usage insight.'
+inputs:
+  path:
+    description: 'Path to the project root'
+    required: false
+    default: '.'
+  fail-on:
+    description: 'Comma-separated list of conditions to fail on (unused, security)'
+    required: false
+    default: 'unused,security'
+  json:
+    description: 'Output results in JSON format'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install Gnorise
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install gnorise
+
+    - name: Run Gnorise Audit
+      shell: bash
+      run: |
+        # Build the command
+        CMD="gnorise audit --path ${{ inputs.path }} --ci"
+        if [ "${{ inputs.json }}" == "true" ]; then
+          CMD="$CMD --json"
+        fi
+        
+        # Execute
+        echo "Running: $CMD"
+        $CMD
