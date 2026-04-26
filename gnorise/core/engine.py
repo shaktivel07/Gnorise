@@ -10,6 +10,7 @@ from gnorise.parsers.lockfile import LockfileParser
 from gnorise.scanners.ast_analyzer import ASTAnalyzer
 from gnorise.core.scorer import DepScore, Evidence, UsageStatus
 from gnorise.resolver.alias import AliasResolver
+from gnorise.core.awareness import CONFIG_TO_PACKAGES
 
 @dataclass
 class UsageInfo:
@@ -56,7 +57,17 @@ class GnoriseEngine:
         lockfile_path = self.root_dir / "package-lock.json"
         dependency_graph = LockfileParser.parse_package_lock(lockfile_path)
         
-        # 3. Analyze Code Usage
+        # 3. Detect present config files
+        present_configs = set()
+        for config_file in CONFIG_TO_PACKAGES:
+            if (self.root_dir / config_file).exists():
+                present_configs.add(config_file)
+        
+        config_used_packages = set()
+        for config in present_configs:
+            config_used_packages.update(CONFIG_TO_PACKAGES[config])
+        
+        # 4. Analyze Code Usage
         # usage_data[pkg] = {'static': {files}, 'dynamic': {files}, 'uncertain': {files}}
         usage_data: Dict[str, Dict[str, Set[Path]]] = {
             pkg: {'static': set(), 'dynamic': set(), 'uncertain': set()} 
@@ -90,7 +101,7 @@ class GnoriseEngine:
         
         self.cache.save()
         
-        # 4. Intelligent Classification using Scorer
+        # 5. Intelligent Classification using Scorer
         package_usage: Dict[str, UsageInfo] = {}
         all_deps = ManifestParser.get_all_dependencies(manifest)
         dev_deps = set(manifest.dev_dependencies.keys())
@@ -108,7 +119,8 @@ class GnoriseEngine:
                 name=pkg, 
                 version=manifest.dependencies.get(pkg) or manifest.dev_dependencies.get(pkg, "0.0.0"),
                 is_dev=(pkg in dev_deps),
-                is_framework_managed=(pkg.lower() in self.KNOWN_CLI_TOOLS or is_framework_managed)
+                is_framework_managed=(pkg.lower() in self.KNOWN_CLI_TOOLS or is_framework_managed),
+                used_by_config=(pkg in config_used_packages)
             )
             
             status, confidence, evidence = scorer.calculate({
@@ -132,6 +144,35 @@ class GnoriseEngine:
             dependency_graph=dependency_graph,
             package_usage=package_usage
         )
+
+    def get_dependency_path(self, target: str, graph: Dict[str, Set[str]]) -> List[List[str]]:
+        """Finds all paths from the root project to the target package."""
+        paths = []
+        root_deps = graph.get("", set())
+        if target in root_deps:
+            paths.append(["(root)", target])
+            
+        visited = set()
+        
+        def find_paths(current, target, path):
+            if current == target:
+                paths.append(list(path))
+                return
+            if current in visited or len(path) > 5:
+                return
+            
+            visited.add(current)
+            for neighbor in graph.get(current, set()):
+                path.append(neighbor)
+                find_paths(neighbor, target, path)
+                path.pop()
+            visited.remove(current)
+
+        for dep in root_deps:
+            if dep != target:
+                find_paths(dep, target, ["(root)", dep])
+                
+        return sorted(paths, key=len)[:3]
 
     def _walk_project(self):
         for root, dirs, files in os.walk(self.root_dir):

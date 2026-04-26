@@ -20,13 +20,13 @@ class LockfileParser:
         # lockfileVersion 2/3 uses 'packages'
         packages = data.get("packages", {})
         for pkg_path, pkg_data in packages.items():
-            if not pkg_path: # Root package
-                continue
-            
             # Remove 'node_modules/' prefix
             pkg_name = pkg_path.replace("node_modules/", "")
-            if "/" in pkg_name and not pkg_name.startswith("@"):
-                # Handle nested node_modules
+            
+            # Use empty string as the key for the root project
+            if pkg_path == "":
+                pkg_name = ""
+            elif "/" in pkg_name and not pkg_name.startswith("@"):
                 pkg_name = pkg_name.split("/")[-1]
             
             deps = pkg_data.get("dependencies", {})

@@ -2,18 +2,25 @@ import typer
 import json as json_lib
 import sys
 import asyncio
+import warnings
 from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.columns import Columns
+from rich.tree import Tree
 from rich import box
-from typing import Optional
+from typing import Optional, Dict, List
+
+# Suppress Tree-sitter and other FutureWarnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 from gnorise.core.engine import GnoriseEngine
 from gnorise.core.scorer import UsageStatus
 from gnorise.core.auditor import Auditor
+from gnorise.core.awareness import get_package_description
+from gnorise.core.metadata import MetadataFetcher
 
 app = typer.Typer(
     name="gnorise",
@@ -64,7 +71,7 @@ def scan(
             "developed_by": "shaktivel (github.com/shaktivel07)",
             "dependencies": {
                 pkg: {
-                    "status": info.status,
+                    "status": info.status.value,
                     "confidence": info.confidence,
                     "usage_count": len(info.files),
                     "reason": info.reason
@@ -75,18 +82,18 @@ def scan(
     else:
         # Summary Dashboard
         total = len(result.package_usage)
-        used = sum(1 for i in result.package_usage.values() if i.status == UsageStatus.USED)
-        possibly = sum(1 for i in result.package_usage.values() if i.status == UsageStatus.POSSIBLY_USED)
+        used = sum(1 for i in result.package_usage.values() if i.status in [UsageStatus.USED, UsageStatus.FRAMEWORK])
+        possibly = sum(1 for i in result.package_usage.values() if i.status in [UsageStatus.POSSIBLY_USED, UsageStatus.DEV_TOOL, UsageStatus.BUILD_TOOL, UsageStatus.TEST_TOOL])
         unused = sum(1 for i in result.package_usage.values() if i.status == UsageStatus.UNUSED)
         
         summary_panel = Panel(
             Columns([
                 f"[bold white]Total:[/] {total}",
                 f"[bold green]Used:[/] {used}",
-                f"[bold yellow]Possibly Used:[/] {possibly}",
+                f"[bold yellow]Infrastructure:[/] {possibly}",
                 f"[bold red]Unused:[/] {unused}"
             ]),
-            title="[bold]Summary[/bold]",
+            title="[bold]Project Intelligence Summary[/bold]",
             box=box.SIMPLE
         )
         console.print(summary_panel)
@@ -98,8 +105,8 @@ def scan(
         table.add_column("Status", style="bold")
         
         for pkg, info in result.package_usage.items():
-            color = "green" if info.status == UsageStatus.USED else "yellow" if info.status == UsageStatus.POSSIBLY_USED else "red"
-            status_styled = f"[{color}]{info.status}[/{color}]"
+            color = "green" if info.status in [UsageStatus.USED, UsageStatus.FRAMEWORK] else "yellow" if info.status != UsageStatus.UNUSED else "red"
+            status_styled = f"[{color}]{info.status.value}[/{color}]"
             table.add_row(pkg, str(len(info.files)), f"{info.confidence}%", status_styled)
         
         console.print(table)
@@ -110,6 +117,89 @@ def scan(
             if not json:
                 console.print(f"\n[bold red]CI Failure:[/bold red] {len(critical_unused)} high-confidence unused dependencies found.")
             sys.exit(1)
+
+@app.command()
+def why(
+    package: str = typer.Argument(..., help="The package to explain"),
+    path: str = typer.Option(".", help="Path to the project"),
+):
+    """
+    [bold magenta]Why[/bold magenta] is this dependency installed?
+    """
+    print_header()
+    root_dir = Path(path)
+    engine = GnoriseEngine(root_dir)
+    
+    with console.status(f"[bold blue]Fetching live intelligence for {package}...[/bold blue]"):
+        result = engine.run_scan()
+        fetcher = MetadataFetcher()
+        loop = asyncio.get_event_loop()
+        meta = loop.run_until_complete(fetcher.fetch(package))
+    
+    if package not in result.package_usage:
+        if package in result.dependency_graph:
+            console.print(f"[yellow]Info: '{package}' is an indirect dependency (not in package.json).[/yellow]")
+        else:
+            console.print(f"[yellow]Info: '{package}' is not part of this project's dependency tree.[/yellow]")
+            # We still proceed to show the Intelligence Report (Live Metadata)
+
+    info = result.package_usage.get(package)
+    
+    console.print(Panel(f"[bold magenta]Intelligence Report: {package}[/bold magenta]", expand=False))
+    
+    console.print(f"[bold cyan]Description:[/] {meta.description}")
+    if meta.homepage:
+        console.print(f"[bold cyan]Homepage:[/] [link={meta.homepage}]{meta.homepage}[/link]")
+    if meta.license:
+        console.print(f"[bold cyan]License:[/] {meta.license}")
+    
+    if info:
+        console.print(f"\nStatus: [bold]{info.status.value}[/] (Confidence: {info.confidence}%)")
+        if info.reason:
+            console.print(f"Primary Signal: [italic]{info.reason}[/italic]")
+        
+        if info.files:
+            console.print(f"\n[bold]Code-level Usage:[/bold] Found in {len(info.files)} files:")
+            for file in info.files[:5]:
+                console.print(f"  • {file.relative_to(root_dir)}")
+            if len(info.files) > 5:
+                console.print(f"  [dim]... and {len(info.files) - 5} more.[/dim]")
+    
+    paths = engine.get_dependency_path(package, result.dependency_graph)
+    if paths:
+        console.print(f"\n[bold]Dependency Chain:[/bold]")
+        for p in paths:
+            console.print(f"  • {' → '.join(p)}")
+
+@app.command()
+def trace(
+    package: str = typer.Argument(..., help="The package to trace"),
+    path: str = typer.Option(".", help="Path to the project"),
+):
+    """
+    [bold cyan]Trace[/bold cyan] the dependency chain from root to package.
+    """
+    print_header()
+    root_dir = Path(path)
+    engine = GnoriseEngine(root_dir)
+    result = engine.run_scan()
+    
+    paths = engine.get_dependency_path(package, result.dependency_graph)
+    
+    if not paths:
+        console.print(f"[red]Error: Could not find dependency chain for '{package}'.[/red]")
+        return
+        
+    console.print(Panel(f"[bold cyan]Dependency Trace: {package}[/bold cyan]", expand=False))
+    
+    for i, p in enumerate(paths):
+        tree = Tree(f"[bold green]{p[0]}[/]")
+        current_node = tree
+        for part in p[1:]:
+            current_node = current_node.add(f"[cyan]{part}[/]")
+        console.print(tree)
+        if i < len(paths) - 1:
+            console.print("[dim]OR[/dim]")
 
 @app.command()
 def doctor(
@@ -161,41 +251,6 @@ def doctor(
     console.print(table)
 
 @app.command()
-def explain(
-    package: str = typer.Argument(..., help="The package to explain"),
-    path: str = typer.Option(".", help="Path to the project"),
-):
-    """
-    [bold magenta]Explain[/bold magenta] where and why a package is used.
-    """
-    print_header()
-    root_dir = Path(path)
-    engine = GnoriseEngine(root_dir)
-    result = engine.run_scan()
-    
-    if package not in result.package_usage:
-        console.print(f"[red]Error: Package '{package}' not found in manifest.[/red]")
-        return
-
-    info = result.package_usage[package]
-    
-    console.print(Panel(f"[bold magenta]Explaining {package}[/bold magenta]", expand=False))
-    console.print(f"Status: {info.status} (Confidence: {info.confidence}%)")
-    
-    if info.reason:
-        console.print(f"Reason: [italic]{info.reason}[/italic]")
-    
-    if info.files:
-        console.print(f"\nUsed in {len(info.files)} files:")
-        for file in info.files:
-            console.print(f"- {file.relative_to(root_dir)}")
-            
-    if info.evidence:
-        console.print("\n[bold]Evidence Breakdown:[/bold]")
-        for ev in info.evidence:
-            console.print(f"  • [cyan]{ev.type}[/]: {ev.explanation} ([dim]{ev.weight} pts[/dim])")
-
-@app.command()
 def clean(
     path: str = typer.Option(".", help="Path to the project"),
 ):
@@ -219,6 +274,7 @@ def clean(
         console.print(f"- [yellow]{pkg}[/yellow] (Confidence: {info.confidence}%)")
     
     console.print("\n[bold]Suggested Action:[/bold] npm uninstall " + " ".join(unused))
+    console.print("[dim]Note: Verify if these are used in build tools or external scripts before removal.[/dim]")
 
 @app.command()
 def impact(
@@ -231,7 +287,12 @@ def impact(
     print_header()
     root_dir = Path(path)
     engine = GnoriseEngine(root_dir)
-    result = engine.run_scan()
+    
+    with console.status(f"[bold blue]Fetching metadata for {package}...[/bold blue]"):
+        result = engine.run_scan()
+        fetcher = MetadataFetcher()
+        loop = asyncio.get_event_loop()
+        meta = loop.run_until_complete(fetcher.fetch(package))
     
     if package not in result.package_usage:
         console.print(f"[red]Error: Package '{package}' not found.[/red]")
@@ -241,13 +302,21 @@ def impact(
     
     console.print(Panel(f"[bold orange3]Impact Analysis: {package}[/bold orange3]", expand=False))
     
+    console.print(f"[bold cyan]Package Description:[/] {meta.description}")
+
+    # 1. Direct code usage
     if info.files:
         console.print(f"[red]CODE IMPACT:[/red] Removing this will break {len(info.files)} files.")
         for file in info.files[:3]:
             console.print(f"- {file.relative_to(root_dir)}")
     else:
-        console.print("[green]NO DIRECT CODE IMPACT:[/green] This package is not imported in your code.")
+        console.print("[yellow]NO DIRECT CODE USAGE DETECTED[/yellow]")
+        if info.status in [UsageStatus.DEV_TOOL, UsageStatus.BUILD_TOOL, UsageStatus.TEST_TOOL]:
+            console.print(f"\n[bold yellow]Caution:[/bold yellow] This is a development/build tool.")
+            console.print("Removing it may break your build pipeline or IDE tooling.")
+            console.print("[bold green]Recommendation:[/bold green] Keep unless you are certain it is no longer needed.")
 
+    # 2. Dependency graph impact
     dependents = [pkg for pkg, deps in result.dependency_graph.items() if package in deps]
     
     if dependents:
@@ -257,8 +326,8 @@ def impact(
     else:
         console.print("\n[green]NO DEPENDENCY IMPACT:[/green] No other installed packages depend on this.")
 
-    if not info.files and not dependents:
-        console.print("\n[bold green]SAFE TO REMOVE:[/bold green] This package is completely isolated.")
+    if not info.files and not dependents and info.status == UsageStatus.UNUSED:
+        console.print("\n[bold green]Likely safe to remove[/bold green], but verify build scripts first.")
 
 @app.command()
 def audit(
@@ -283,7 +352,7 @@ def audit(
     
     auditor = Auditor()
     all_deps = {**scan_result.manifest.dependencies, **scan_result.manifest.dev_dependencies}
-    used_packages = {pkg for pkg, info in scan_result.package_usage.items() if info.status == UsageStatus.USED}
+    used_packages = {pkg for pkg, info in scan_result.package_usage.items() if info.status in [UsageStatus.USED, UsageStatus.FRAMEWORK]}
     
     if not json:
         with console.status("[bold red]Auditing vulnerabilities...[/bold red]"):
@@ -300,22 +369,27 @@ def audit(
         if not audit_results:
             console.print("[green]No known vulnerabilities found in your dependencies![/green]")
         else:
-            console.print(Panel("[bold red]Vulnerability Audit Results[/bold red]", expand=False))
+            console.print(Panel("[bold red]Security Audit Summary[/bold red]", expand=False))
+            
             table = Table(box=box.SIMPLE_HEAD)
             table.add_column("Package", style="magenta")
-            table.add_column("Vuln ID", style="bold")
+            table.add_column("Vulnerabilities", justify="center")
             table.add_column("Used?", justify="center")
-            table.add_column("Summary")
+            table.add_column("Recommended Action")
             
             for res in audit_results:
                 used_styled = "[green]Yes[/green]" if res.is_used else "[yellow]No[/yellow]"
-                for vuln in res.vulnerabilities:
-                    table.add_row(res.package, vuln.id, used_styled, vuln.summary or "N/A")
+                vuln_count = len(res.vulnerabilities)
+                
+                action = "Upgrade to latest" if res.is_used else "Safe to remove"
+                table.add_row(res.package, str(vuln_count), used_styled, action)
+            
             console.print(table)
             
+            # Specific insights
             unused_vulns = [res for res in audit_results if not res.is_used]
             if unused_vulns:
-                console.print(f"\n[cyan]Insight:[/cyan] {len(unused_vulns)} vulnerable packages are [bold]not used[/bold] in your code. You can safely remove them to reduce risk.")
+                console.print(f"\n[cyan]Insight:[/cyan] {len(unused_vulns)} vulnerable packages are [bold]not used[/bold] in your code. Removing them is the safest fix.")
 
     if ci:
         used_vulns = [res for res in audit_results if res.is_used]
